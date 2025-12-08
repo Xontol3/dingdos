@@ -69,7 +69,7 @@ const CONFIG_URL =
   process.env.CONFIG_URL || 'https://botapi.ihsan83636.workers.dev';
 
 const port = process.env.PORT || process.env.SERVER_PORT || 2090;
-const NODE_TYPE = process.env.NODE_TYPE || 'master'; // 'master' | 'agent'
+const NODE_TYPE = process.env.NODE_TYPE || 'agent'; // 'master' | 'agent'
 
 // Agent node: minimal log
 if (NODE_TYPE === 'agent') {
