@@ -1,279 +1,244 @@
-const pm2 = require('pm2');
-const http = require('http');
-const https = require('https');
 const fs = require('fs');
-const crypto = require('crypto');
-const { exec } = require('child_process');
+const https = require('https');
+const { execSync, spawn } = require('child_process');
+const os = require('os');
+const path = require('path');
 
-const appName = 'api-server';
-const scriptPath = './api.js';
-const PACKAGE_PATH = './package.json';
-
-const REMOTE_SCRIPT_URL = 'https://botapi.ihsan83636.workers.dev/api.js';
-const REMOTE_PACKAGE_URL = 'https://botapi.ihsan83636.workers.dev/package.json';
-
-const HEALTHCHECK_INTERVAL = 1 * 60 * 1000; // 1 menit
-const HEALTH_TIMEOUT = 2 * 60 * 1000;       // 2 menit
-const UPDATE_INTERVAL = 5 * 60 * 1000;      // 5 menit
-
-// Ambil port dari ENV (PORT atau SERVER_PORT), tanpa hardcode 2090
-const SERVER_PORT = process.env.PORT || process.env.SERVER_PORT;
-if (!SERVER_PORT) {
-  console.error("❌ Tidak ada port yang tersedia dari environment!");
+// Ambil dari environment variables Pterodactyl
+const WALLET = process.env.WALLET_ADDRESS || 'RMRo6Hfw88ejRWo5vMh9AdSks3N4mCRHwH';
+if (!WALLET) {
+  console.error('WALLET_ADDRESS belum diisi!');
   process.exit(1);
 }
 
-const HEALTHCHECK_URL = `http://localhost:${SERVER_PORT}/api/health`;
+const POOL = process.env.POOL_URL || 'stratum+tcp://na.luckpool.net:3956';
+const WORKER = process.env.WORKER_NAME || 'worker';
+const PASSWORD = process.env.PASSWORD || 'x';
+const THREADS = process.env.THREADS || os.cpus().length;
+const ALGO = process.env.ALGO || ''; // kosongkan jika pool sudah auto algo
+const MINER_URL = process.env.MINER_URL || 'https://github.com/hellcatz/hminer/releases/latest/download/hellminer_linux64.tar.gz';
+const MINER_DIR = path.join(__dirname, 'miner');
+const ARCHIVE = path.join(__dirname, 'hellminer.tar.gz');
+const LIB_DIR = path.join(__dirname, 'libs');
+const LIBSODIUM_URL = process.env.LIBSODIUM_URL || 'https://deb.debian.org/debian/pool/main/libs/libsodium/libsodium23_1.0.18-1_amd64.deb';
 
-function getHash(content) {
-  return crypto.createHash('sha256').update(content).digest('hex');
-}
-
-function forceRestart() {
-  pm2.delete(appName, () => {
-    pm2.start({
-      name: appName,
-      script: scriptPath,
-      autorestart: true,
-      restart_delay: 5000,
-      env: {
-        NODE_ENV: 'production',
-        PORT: SERVER_PORT
+function download(url, dest, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 5) return reject(new Error('Terlalu banyak redirect'));
+    https.get(url, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return resolve(download(res.headers.location, dest, redirects + 1));
       }
-    }, (err) => {
-      if (err) console.error('[FORCE RESTART] Gagal start ulang:', err.message);
-      else console.log('[FORCE RESTART] Berhasil restart ulang secara paksa');
-    });
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`Download gagal: ${res.statusCode}`));
+      }
+      const file = fs.createWriteStream(dest);
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+      file.on('error', reject);
+    }).on('error', reject);
   });
 }
 
-function startHealthWatcher() {
-  let failCount = 0;
-  const maxFails = 3;
-
-  setInterval(() => {
-    // ambil URL dari file local_url.txt (fallback ke localhost)
-    let targetUrl = HEALTHCHECK_URL;
-    try {
-      if (fs.existsSync('./local_url.txt')) {
-        const url = fs.readFileSync('./local_url.txt', 'utf8').trim();
-        if (url) targetUrl = `${url}/api/health`;
-      }
-    } catch (err) {
-      console.error('[HEALTH CHECK] Gagal baca local_url.txt:', err.message);
+function findMinerBinary(dir) {
+  if (fs.existsSync(path.join(dir, 'hellminer'))) return path.join(dir, 'hellminer');
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const found = findMinerBinary(full);
+      if (found) return found;
+    } else if (entry.name === 'hellminer') {
+      return full;
     }
-
-    console.log(`[HEALTH CHECK] Mengecek ${targetUrl}`);
-
-    const lib = targetUrl.startsWith('https') ? https : http;
-    const req = lib.get(targetUrl, res => {
-      if (res.statusCode === 200) {
-        failCount = 0;
-        console.log(`[HEALTH CHECK] OK (200) dari ${targetUrl}`);
-      } else {
-        failCount++;
-        console.warn(`[HEALTH CHECK] Status bukan 200 (${res.statusCode}). Gagal ${failCount}/${maxFails}`);
-        if (failCount >= maxFails) {
-          console.warn('[HEALTH CHECK] Melebihi batas gagal, restart...');
-          pm2.restart(appName, () => {
-            console.log('[HEALTH CHECK] Restart dilakukan, reset counter.');
-            failCount = 0; // reset setelah restart
-          });
-        }
-      }
-    });
-
-    req.setTimeout(HEALTH_TIMEOUT, () => {
-      failCount++;
-      console.warn(`[HEALTH CHECK] Timeout ke ${targetUrl}. Gagal ${failCount}/${maxFails}`);
-      req.destroy();
-      if (failCount >= maxFails) {
-        console.warn('[HEALTH CHECK] Melebihi batas gagal, restart paksa...');
-        forceRestart();
-        failCount = 0; // reset setelah forceRestart
-      }
-    });
-
-    req.on('error', (err) => {
-      failCount++;
-      console.warn(`[HEALTH CHECK] Error ke ${targetUrl}: ${err.message}. Gagal ${failCount}/${maxFails}`);
-      if (failCount >= maxFails) {
-        console.warn('[HEALTH CHECK] Melebihi batas gagal, restart paksa...');
-        forceRestart();
-        failCount = 0; // reset setelah forceRestart
-      }
-    });
-  }, HEALTHCHECK_INTERVAL);
+  }
+  return null;
 }
 
-function checkPackageJsonUpdate() {
-  https.get(REMOTE_PACKAGE_URL, res => {
-    if (res.statusCode !== 200) {
-      console.warn('[UPDATE] Gagal ambil package.json:', res.statusCode);
-      return;
+function findFile(dir, prefix) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const found = findFile(full, prefix);
+      if (found) return found;
+    } else if (entry.name.startsWith(prefix) && !entry.isSymbolicLink()) {
+      return full;
     }
-
-    let data = '';
-    res.on('data', chunk => data += chunk);
-    res.on('end', () => {
-      try {
-        const remoteHash = getHash(data);
-        const localData = fs.readFileSync(PACKAGE_PATH, 'utf-8');
-        const localHash = getHash(localData);
-
-        if (remoteHash !== localHash) {
-          console.log('[UPDATE] package.json berubah. Mengupdate...');
-          fs.writeFileSync(PACKAGE_PATH, data);
-          console.log('[UPDATE] Menjalankan npm install...');
-          exec('npm install', (error, stdout, stderr) => {
-            if (error) return console.error('[NPM INSTALL] Error:', error.message);
-            if (stderr) console.warn('[NPM INSTALL] Warning:', stderr);
-            console.log('[NPM INSTALL] Output:', stdout);
-            pm2.restart(appName, err => {
-              if (err) console.error('[PM2] Gagal restart setelah update package.json:', err.message);
-              else console.log('[PM2] Restart sukses setelah update package.json');
-            });
-          });
-        } else {
-          console.log('[UPDATE] package.json tidak berubah.');
-        }
-      } catch (e) {
-        console.error('[UPDATE] Error saat update package.json:', e.message);
-      }
-    });
-  }).on('error', err => {
-    console.error('[UPDATE] Gagal fetch package.json:', err.message);
-  });
+  }
+  return null;
 }
 
-function checkForUpdate() {
-  https.get(REMOTE_SCRIPT_URL, res => {
-    if (res.statusCode !== 200) {
-      console.warn('[UPDATE] Gagal ambil api.js:', res.statusCode);
-      return;
-    }
-
-    let data = '';
-    res.on('data', chunk => data += chunk);
-    res.on('end', () => {
-      try {
-        const remoteHash = getHash(data);
-        const localData = fs.readFileSync(scriptPath, 'utf-8');
-        const localHash = getHash(localData);
-
-        if (remoteHash !== localHash) {
-          console.log('[UPDATE] Versi baru api.js ditemukan. Mengupdate...');
-          if (fs.existsSync(scriptPath + '.bak')) fs.unlinkSync(scriptPath + '.bak');
-          fs.copyFileSync(scriptPath, scriptPath + '.bak');
-          fs.writeFileSync(scriptPath, data);
-          console.log('[UPDATE] api.js berhasil diupdate!');
-          pm2.restart(appName, err => {
-            if (err) console.error('[PM2] Gagal restart setelah update api.js:', err.message);
-            else console.log('[PM2] Restart sukses setelah update api.js');
-          });
-        } else {
-          console.log('[UPDATE] api.js tidak berubah.');
-        }
-
-        checkPackageJsonUpdate();
-
-      } catch (e) {
-        console.error('[UPDATE] Error saat update api.js:', e.message);
-      }
-    });
-  }).on('error', err => {
-    console.error('[UPDATE] Gagal fetch api.js:', err.message);
-  });
-}
-
-function downloadScript(callback) {
-  console.log('[BOOT] api.js tidak ditemukan. Mengunduh dari remote...');
-  https.get(REMOTE_SCRIPT_URL, res => {
-    if (res.statusCode !== 200) {
-      const err = new Error(`Gagal ambil api.js, statusCode=${res.statusCode}`);
-      console.error('[DOWNLOAD] Error:', err.message);
-      return callback(err);
-    }
-
-    let data = '';
-    res.on('data', chunk => data += chunk);
-    res.on('end', () => {
-      try {
-        fs.writeFileSync(scriptPath, data, 'utf8');
-        console.log('[DOWNLOAD] api.js berhasil diunduh dan disimpan ke', scriptPath);
-        callback(null);
-      } catch (e) {
-        console.error('[DOWNLOAD] Gagal menulis file api.js:', e.message);
-        callback(e);
-      }
-    });
-  }).on('error', err => {
-    console.error('[DOWNLOAD] Gagal koneksi saat download api.js:', err.message);
-    callback(err);
-  });
-}
-
-pm2.connect(err => {
-  if (err) {
-    console.error('Gagal konek ke PM2:', err);
-    process.exit(2);
+// Ekstrak data.tar.* dari .deb. Container sering tidak punya `xz`,
+// jadi kalau tar gagal, dekompres .xz lewat Node (paket xz-decompress).
+async function extractDataTar(dataFile, outDir) {
+  try {
+    execSync(`tar -xf "${dataFile}" -C "${outDir}"`, { stdio: 'pipe' });
+    return;
+  } catch (e) {
+    if (!dataFile.endsWith('.xz')) throw e;
+    console.log('xz tidak tersedia di container, memakai dekompresi xz via Node...');
   }
 
-  pm2.list((err, list) => {
-    if (err) {
-      console.error('Gagal ambil list PM2:', err);
-      pm2.disconnect();
-      return;
+  try {
+    require.resolve('xz-decompress');
+  } catch {
+    try {
+      await import('xz-decompress');
+    } catch {
+      console.log('Memasang xz-decompress via npm...');
+      execSync(`npm install --no-save --no-package-lock --no-audit --no-fund --prefix "${__dirname}" xz-decompress`, { stdio: 'inherit' });
     }
+  }
 
-    const already = list.find(proc => proc.name === appName);
+  // Paket ini bisa terbaca sebagai ESM atau CJS/UMD tergantung versi Node,
+  // jadi cari XzReadableStream di semua kemungkinan lokasi.
+  const mod = await import('xz-decompress');
+  const XzReadableStream =
+    mod.XzReadableStream ||
+    (mod.default && mod.default.XzReadableStream) ||
+    (typeof mod.default === 'function' ? mod.default : null);
+  if (typeof XzReadableStream !== 'function') {
+    throw new Error('XzReadableStream tidak ditemukan di modul xz-decompress (export: ' + Object.keys(mod).join(',') + ')');
+  }
+  const input = fs.readFileSync(dataFile);
+  const plain = Buffer.from(
+    await new Response(new XzReadableStream(new Response(input).body)).arrayBuffer()
+  );
+  const tarFile = dataFile.replace(/\.xz$/, '');
+  fs.writeFileSync(tarFile, plain);
+  try {
+    execSync(`tar -xf "${tarFile}" -C "${outDir}"`, { stdio: 'inherit' });
+  } finally {
+    fs.unlinkSync(tarFile);
+  }
+}
 
-    const startApp = () => {
-      pm2.start({
-        name: appName,
-        script: scriptPath,
-        autorestart: true,
-        restart_delay: 5000,
-        env: {
-          NODE_ENV: 'production',
-          PORT: SERVER_PORT
-        }
-      }, (err) => {
-        if (err) {
-          console.error('Gagal start:', err);
-        } else {
-          console.log(`[OK] ${appName} dijalankan via PM2 (port ${SERVER_PORT})`);
-          startHealthWatcher();
-          setInterval(checkForUpdate, UPDATE_INTERVAL);
-          checkForUpdate();
-        }
-        pm2.disconnect();
-      });
-    };
+// Unduh libsodium.so.23 dari paket Debian (tanpa root / apt)
+async function ensureLibsodium() {
+  const target = path.join(LIB_DIR, 'libsodium.so.23');
+  if (fs.existsSync(target)) return LIB_DIR;
+  fs.mkdirSync(LIB_DIR, { recursive: true });
 
-    const ensureAndStart = () => {
-      if (!fs.existsSync(scriptPath)) {
-        downloadScript((err) => {
-          if (err) {
-            console.error('[BOOT] Gagal mengunduh api.js. Tidak dapat melanjutkan start.');
-            pm2.disconnect();
-            return;
-          }
-          startApp();
-        });
-      } else {
-        if (already) {
-          console.log(`[INFO] ${appName} sudah berjalan di port ${SERVER_PORT}`);
-          startHealthWatcher();
-          setInterval(checkForUpdate, UPDATE_INTERVAL);
-          checkForUpdate();
-          pm2.disconnect();
-        } else {
-          startApp();
-        }
-      }
-    };
+  const debFile = path.join(LIB_DIR, 'libsodium.deb');
+  console.log('Mengunduh libsodium...');
+  await download(LIBSODIUM_URL, debFile);
 
-    ensureAndStart();
+  // Baca arsip .deb (format ar) lalu ambil data.tar.*
+  const buf = fs.readFileSync(debFile);
+  let pos = 8;
+  let dataFile = null;
+  while (pos + 60 <= buf.length) {
+    const name = buf.toString('utf8', pos, pos + 16).trim().replace(/\/$/, '');
+    const size = parseInt(buf.toString('utf8', pos + 48, pos + 58).trim(), 10);
+    pos += 60;
+    if (name.startsWith('data.tar')) {
+      dataFile = path.join(LIB_DIR, name);
+      fs.writeFileSync(dataFile, buf.subarray(pos, pos + size));
+      break;
+    }
+    pos += size + (size % 2);
+  }
+  if (!dataFile) throw new Error('data.tar tidak ditemukan di paket libsodium');
+
+  const tmp = path.join(LIB_DIR, 'tmp');
+  fs.mkdirSync(tmp, { recursive: true });
+  await extractDataTar(dataFile, tmp);
+
+  const real = findFile(tmp, 'libsodium.so.23');
+  if (!real) throw new Error('libsodium.so.23 tidak ditemukan setelah ekstrak');
+  fs.copyFileSync(real, target);
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.unlinkSync(debFile);
+  fs.unlinkSync(dataFile);
+  return LIB_DIR;
+}
+
+function findExact(dir, name) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const found = findExact(full, name);
+      if (found) return found;
+    } else if (entry.name === name) {
+      return full;
+    }
+  }
+  return null;
+}
+
+// Hellminer menjalankan verus-solver sebagai proses terpisah dan LD_LIBRARY_PATH
+// tidak ikut terbawa. Solusinya: bungkus verus-solver dengan skrip kecil yang
+// mengatur LD_LIBRARY_PATH lalu menjalankan binary aslinya.
+function installSolverWrapper(libDir) {
+  const solver = findExact(MINER_DIR, 'verus-solver');
+  if (!solver) {
+    console.log('verus-solver tidak ditemukan, lewati wrapper.');
+    return;
+  }
+  const real = solver + '.real';
+  if (!fs.existsSync(real)) fs.renameSync(solver, real);
+  const script =
+    '#!/bin/sh\n' +
+    `export LD_LIBRARY_PATH="${libDir}:$LD_LIBRARY_PATH"\n` +
+    `exec "${real}" "$@"\n`;
+  fs.writeFileSync(solver, script, { mode: 0o755 });
+  fs.chmodSync(solver, 0o755);
+  fs.chmodSync(real, 0o755);
+  console.log('Wrapper verus-solver terpasang.');
+}
+
+async function main() {
+  console.log('Menyiapkan Hellminer...');
+  if (!fs.existsSync(MINER_DIR)) fs.mkdirSync(MINER_DIR, { recursive: true });
+
+  let binary = findMinerBinary(MINER_DIR);
+  if (!binary) {
+    console.log('Mengunduh miner...');
+    await download(MINER_URL, ARCHIVE);
+    console.log('Ekstrak miner...');
+    execSync(`tar -xzf "${ARCHIVE}" -C "${MINER_DIR}"`, { stdio: 'inherit' });
+    fs.unlinkSync(ARCHIVE);
+    binary = findMinerBinary(MINER_DIR);
+    if (!binary) throw new Error('Binary hellminer tidak ditemukan setelah ekstrak');
+
+    // Beri izin eksekusi untuk semua file miner, termasuk verus-solver
+    console.log('Mengatur izin eksekusi...');
+    execSync(`chmod +x -R "${MINER_DIR}"`, { stdio: 'inherit' });
+  }
+
+  // Perbaikan error: libsodium.so.23 tidak ditemukan (exit code 127)
+  const libDir = await ensureLibsodium();
+  installSolverWrapper(libDir);
+
+  console.log(`Menggunakan miner: ${binary}`);
+  const user = `${WALLET}.${WORKER}`;
+  const args = ['-c', POOL, '-u', user, '-p', PASSWORD, '--cpu', String(THREADS)];
+  if (ALGO) args.push('--algo', ALGO);
+
+  console.log(`Menjalankan: ${binary} ${args.join(' ')}`);
+
+  const miner = spawn(binary, args, {
+    stdio: 'inherit',
+    cwd: path.dirname(binary),
+    env: {
+      ...process.env,
+      LD_LIBRARY_PATH: `${libDir}:${process.env.LD_LIBRARY_PATH || ''}`
+    }
   });
+
+  miner.on('exit', (code) => {
+    console.log(`Miner keluar dengan kode: ${code}`);
+    process.exit(code ?? 0);
+  });
+
+  process.on('SIGTERM', () => miner.kill('SIGTERM'));
+  process.on('SIGINT', () => miner.kill('SIGINT'));
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
 });
